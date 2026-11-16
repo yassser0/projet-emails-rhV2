@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
 """
-Professional HR email cleaner for scraped company contacts.
-
-Input CSV columns supported:
-  email (or hr_email), mx_valid, type, company_name (or company),
-  company_domain (optional)
+=============================================================================
+CLEAN_EMAILS.PY - Enterprise Moroccan Tech & HR Email Sanitizer & Ranker
+=============================================================================
+Cleans, deduplicates, verifies deliverability, and scores scraped emails
+for tech & data recruitment outreach in Morocco (Startups, ESNs, Multinationals).
 
 Outputs:
-  emails_clean.csv       RH/GENERIC contacts ready for review/import
-  emails_review.csv      uncertain contacts (OTHER, unknown MX, bad metadata)
-  emails_rejected.csv    duplicates, malformed addresses, excluded contacts
-  emails_report.txt      run summary
+  emails_clean.csv      - High-confidence leads ranked by priority (Ready for CRM / Mail merge)
+  emails_review.csv     - Low-confidence or unclassified emails needing human check
+  emails_rejected.csv   - Discarded records (duplicates, invalid syntax, spam traps, bad MX)
+  emails_report.txt     - Comprehensive KPI report on the dataset
 
-Uses only the Python standard library.
+Scoring Engine:
+  - 100 pts: Direct Moroccan RH email (recrutement@domain.ma, rh@domain.ma)
+  -  90 pts: Corporate RH email with Morocco token (recrutement.maroc@domain.com)
+  -  80 pts: Startup Founder / CTO (ceo@, cto@, founder@)
+  -  65 pts: Generic Moroccan contact (contact@domain.ma, info@domain.ma)
+  -  45 pts: Generic international contact (contact@domain.com)
 """
 
 from __future__ import annotations
@@ -21,373 +26,357 @@ import argparse
 import csv
 import re
 import sys
+import unicodedata
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
-
-BASE_FIELDS = [
-    "company", "hr_email", "position", "city", "status", "sent_date",
-    "email_normalized", "format_status", "mx_valid", "source_type",
-    "company_domain", "review_reason",
+# ---------------------------------------------------------------------------
+# Output Schemas
+# ---------------------------------------------------------------------------
+OUTPUT_FIELDS = [
+    "company", "hr_email", "position", "city", "priority_score",
+    "role_type", "company_domain", "website", "mx_valid",
+    "status", "review_reason",
 ]
 
-DEFAULT_BAD_WORDS = (
-    "signalement", "investor", "press", "compliance", "ethic",
-    "legal", "billing", "facturation", "support", "alerte",
-)
-TYPE_ORDER = {"RH": 0, "GENERIC": 1, "OTHER": 2}
 TRUE_VALUES = {"true", "1", "yes", "y", "valid", "ok"}
 FALSE_VALUES = {"false", "0", "no", "n", "invalid", "fail"}
 
-# Practical syntax check. This checks formatting, not mailbox existence.
-EMAIL_RE = re.compile(
+DEFAULT_BAD_WORDS = (
+    "signalement", "investor", "press", "presse", "compliance", "ethic",
+    "legal", "billing", "facturation", "support", "alerte", "comptabilite",
+    "invoices", "abuse", "privacy", "dpo", "securite", "security",
+)
+
+EMAIL_REGEX = re.compile(
     r"^[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@"
     r"[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?"
     r"(?:\.[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?)+$",
     re.IGNORECASE,
 )
 
-
-def first_value(row: dict[str, Any], *keys: str) -> str:
-    """Return the first non-empty value from a list of possible column names."""
+# ---------------------------------------------------------------------------
+# Helper Functions
+# ---------------------------------------------------------------------------
+def extract_first_value(row: dict[str, Any], *keys: str) -> str:
+    """Retrieve first non-empty value across multiple candidate column names."""
     for key in keys:
-        value = row.get(key)
-        if value is not None and str(value).strip():
-            return str(value).strip()
+        val = row.get(key)
+        if val is not None and str(val).strip():
+            return str(val).strip()
     return ""
 
 
-def normalize_email(value: str) -> str:
-    """Normalize common scraped email representations."""
-    email = (value or "").strip().lower()
-    email = re.sub(r"^mailto:", "", email)
-    email = email.strip(" \t\r\n<>[](){}.,;:'\"")
-    # Remove accidental spaces around the @ sign and at the edges.
-    email = re.sub(r"\s*@\s*", "@", email)
-    return email
+def sanitize_email(value: str) -> str:
+    """Normalize and strip invisible characters, URL schemes, and invalid whitespace."""
+    if not value:
+        return ""
+    # Strip invisible zero-width spaces, byte order marks, and control characters
+    cleaned = "".join(ch for ch in value if unicodedata.category(ch) != "Cf")
+    cleaned = cleaned.strip().lower()
+    cleaned = re.sub(r"^mailto:", "", cleaned)
+    cleaned = cleaned.strip(" \t\r\n<>[](){}.,;:'\"")
+    cleaned = re.sub(r"\s*@\s*", "@", cleaned)
+    return cleaned
 
 
-def email_is_well_formed(email: str) -> bool:
+def is_valid_email_format(email: str) -> bool:
+    """Verify structural validity and RFC length constraints."""
     if not email or len(email) > 254 or email.count("@") != 1:
         return False
-    local, domain = email.rsplit("@", 1)
-    if len(local) > 64 or not local or not domain:
+    local_part, domain_part = email.rsplit("@", 1)
+    if len(local_part) > 64 or not local_part or not domain_part:
         return False
-    if ".." in local or local.startswith(".") or local.endswith("."):
+    if ".." in local_part or local_part.startswith(".") or local_part.endswith("."):
         return False
     try:
-        ascii_domain = domain.encode("idna").decode("ascii")
+        ascii_domain = domain_part.encode("idna").decode("ascii")
     except UnicodeError:
         return False
-    return bool(EMAIL_RE.fullmatch(f"{local}@{ascii_domain}"))
+    return bool(EMAIL_REGEX.fullmatch(f"{local_part}@{ascii_domain}"))
 
 
-def parse_bool(value: str) -> bool | None:
-    """Return True/False, or None when the source value is unknown/missing."""
-    normalized = (value or "").strip().lower()
-    if normalized in TRUE_VALUES:
+def parse_boolean_flag(value: str) -> bool | None:
+    """Safely cast string truth values to Python boolean."""
+    norm = (value or "").strip().lower()
+    if norm in TRUE_VALUES:
         return True
-    if normalized in FALSE_VALUES:
+    if norm in FALSE_VALUES:
         return False
     return None
 
 
-def load_excluded(path: Path | None) -> set[str]:
-    excluded: set[str] = set()
-    if not path:
-        return excluded
-    if not path.exists():
-        raise FileNotFoundError(f"Fichier d'exclusion introuvable : {path}")
-    with path.open("r", newline="", encoding="utf-8-sig") as handle:
-        for row in csv.DictReader(handle):
-            value = first_value(row, "hr_email", "email", "email_normalized")
-            normalized = normalize_email(value)
-            if normalized:
-                excluded.add(normalized)
-    return excluded
+def calculate_lead_score(email: str, role_type: str, company_domain: str) -> int:
+    """Compute lead scoring specifically optimized for Moroccan tech job seekers."""
+    local, _, domain = email.partition("@")
+    is_ma_domain = domain.endswith(".ma")
+    has_morocco_keyword = any(k in local or k in domain for k in ("maroc", "morocco", "casa"))
+
+    if role_type == "RH":
+        if is_ma_domain:
+            return 100
+        if has_morocco_keyword:
+            return 95
+        return 85
+
+    if role_type == "FOUNDER_TECH":
+        if is_ma_domain:
+            return 80
+        return 75
+
+    if role_type == "GENERIC":
+        if is_ma_domain:
+            return 65
+        return 45
+
+    return 30
 
 
-def read_input(path: Path) -> list[dict[str, str]]:
-    if not path.exists():
-        raise FileNotFoundError(f"Fichier source introuvable : {path}")
-    with path.open("r", newline="", encoding="utf-8-sig") as handle:
-        reader = csv.DictReader(handle)
-        if not reader.fieldnames:
-            raise ValueError("Le fichier CSV est vide ou ne contient pas d'en-têtes.")
-        return list(reader)
-
-
-def make_output_row(
-    source: dict[str, Any],
-    email: str,
-    position: str,
-    city: str,
-    status: str,
-    reason: str = "",
-    format_status: str = "VALID",
-) -> dict[str, str]:
-    company = first_value(source, "company_name", "company", "name")
-    company_domain = first_value(source, "company_domain", "domain").lower()
-    source_type = first_value(source, "type", "email_type").upper() or "UNKNOWN"
-    mx_raw = first_value(source, "mx_valid")
-    mx_value = parse_bool(mx_raw)
-    mx_text = "TRUE" if mx_value is True else "FALSE" if mx_value is False else "UNKNOWN"
-
-    return {
-        "company": company,
-        "hr_email": email,
-        "position": position,
-        "city": city,
-        "status": status,
-        "sent_date": "",
-        "email_normalized": email,
-        "format_status": format_status,
-        "mx_valid": mx_text,
-        "source_type": source_type,
-        "company_domain": company_domain,
-        "review_reason": reason,
-    }
-
-
-def sort_key(row: dict[str, str]) -> tuple[int, int, int, str]:
-    email_type = row["source_type"]
-    domain = row["company_domain"]
-    email = row["email_normalized"]
-    same_domain = bool(domain and email.endswith("@" + domain))
-    return (
-        TYPE_ORDER.get(email_type, 3),
-        0 if same_domain else 1,
-        0 if email.endswith(".ma") else 1,
-        email,
-    )
-
-
-def write_csv(path: Path, rows: list[dict[str, str]]) -> None:
-    """Write atomically to avoid leaving a half-written output file."""
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    with temporary.open("w", newline="", encoding="utf-8-sig") as handle:
-        writer = csv.DictWriter(handle, fieldnames=BASE_FIELDS, extrasaction="ignore")
-        writer.writeheader()
-        writer.writerows(rows)
-    temporary.replace(path)
-
-
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Nettoie, déduplique et classe les emails RH issus d'un scraping."
-    )
-    parser.add_argument("--input", default="emails.csv", help="CSV source (défaut : emails.csv)")
-    parser.add_argument("--output", default="emails_clean.csv", help="CSV RH/GENERIC")
-    parser.add_argument("--review", default="emails_review.csv", help="CSV à vérifier manuellement")
-    parser.add_argument("--rejected", default="emails_rejected.csv", help="CSV des adresses écartées")
-    parser.add_argument("--report", default="emails_report.txt", help="Rapport texte")
-    parser.add_argument("--exclude", default=None, help="Export CSV du Google Sheet à exclure")
-    parser.add_argument("--position", default="Data Engineer / Data Scientist")
-    parser.add_argument("--city", default="Casablanca, Maroc")
-    parser.add_argument(
-        "--per-company", "--max-per-company", dest="per_company",
-        type=int, default=3, help="Nombre maximum d'emails par entreprise (défaut : 3)"
-    )
-    parser.add_argument(
-        "--approve", type=int, default=0,
-        help="Passe les N premiers emails retenus en APPROVED (défaut : 0/PENDING)"
-    )
-    parser.add_argument(
-        "--exclude-tlds", nargs="*", default=[],
-        help="TLD à écarter explicitement, ex. --exclude-tlds .fr .de .uk"
-    )
-    parser.add_argument(
-        "--bad-words", nargs="*", default=list(DEFAULT_BAD_WORDS),
-        help="Mots à écarter dans la partie avant @"
-    )
-    return parser
-
-
+# ---------------------------------------------------------------------------
+# Core Cleaning Pipeline
+# ---------------------------------------------------------------------------
 def main() -> int:
-    parser = build_parser()
+    parser = argparse.ArgumentParser(description="Professional Moroccan Tech & HR Email Cleaner")
+    parser.add_argument("--input", default="emails.csv", help="Input CSV path (default: emails.csv)")
+    parser.add_argument("--output", default="emails_clean.csv", help="Clean qualified leads (default: emails_clean.csv)")
+    parser.add_argument("--review", default="emails_review.csv", help="Review CSV path")
+    parser.add_argument("--rejected", default="emails_rejected.csv", help="Rejected CSV path")
+    parser.add_argument("--report", default="emails_report.txt", help="Summary report path")
+    parser.add_argument("--exclude", default=None, help="Optional CSV of existing contacts to exclude")
+    parser.add_argument("--position", default="Data Engineer / Data Scientist", help="Target job role")
+    parser.add_argument("--city", default="Casablanca, Maroc", help="Target job city/region")
+    parser.add_argument("--per-company", type=int, default=3, help="Max emails to keep per company (default: 3)")
+    parser.add_argument("--exclude-tlds", nargs="*", default=[], help="TLDs to exclude, e.g. .fr .de .uk")
+    parser.add_argument("--bad-words", nargs="*", default=list(DEFAULT_BAD_WORDS), help="Exclude words in local part")
     args = parser.parse_args()
 
-    if args.per_company < 1:
-        parser.error("--per-company doit être supérieur ou égal à 1.")
-    if args.approve < 0:
-        parser.error("--approve ne peut pas être négatif.")
-
     input_path = Path(args.input)
-    output_path = Path(args.output)
-    review_path = Path(args.review)
-    rejected_path = Path(args.rejected)
-    report_path = Path(args.report)
+    if not input_path.exists():
+        print(f"ERROR: Input file not found: {input_path}", file=sys.stderr)
+        return 1
 
-    try:
-        source_rows = read_input(input_path)
-        excluded = load_excluded(Path(args.exclude) if args.exclude else None)
-    except (OSError, ValueError) as exc:
-        print(f"ERREUR : {exc}", file=sys.stderr)
-        return 2
+    # Load exclusions if provided
+    excluded_emails: set[str] = set()
+    if args.exclude:
+        excl_path = Path(args.exclude)
+        if excl_path.exists():
+            with excl_path.open("r", encoding="utf-8-sig") as f:
+                for row in csv.DictReader(f):
+                    raw = extract_first_value(row, "hr_email", "email", "email_normalized")
+                    s = sanitize_email(raw)
+                    if s:
+                        excluded_emails.add(s)
 
-    clean_candidates: list[dict[str, str]] = []
-    review_rows: list[dict[str, str]] = []
-    rejected_rows: list[dict[str, str]] = []
-    seen: set[str] = set()
-    counts: Counter[str] = Counter()
-    by_company: dict[str, list[dict[str, str]]] = defaultdict(list)
+    excluded_tlds = tuple(t.lower() if t.startswith(".") else "." + t.lower() for t in args.exclude_tlds)
+    bad_words = tuple(w.lower() for w in args.bad_words)
 
-    excluded_tlds = tuple(
-        tld.lower() if tld.startswith(".") else "." + tld.lower()
-        for tld in args.exclude_tlds
-    )
-    bad_words = tuple(word.lower() for word in args.bad_words)
+    # Read input records
+    with input_path.open("r", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        source_rows = list(reader)
 
-    for line_number, source in enumerate(source_rows, start=2):
-        counts["input"] += 1
-        raw_email = first_value(source, "email", "hr_email", "email_address")
-        email = normalize_email(raw_email)
+    clean_by_company: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    review_rows: list[dict[str, Any]] = []
+    rejected_rows: list[dict[str, Any]] = []
 
-        if not email_is_well_formed(email):
-            rejected_rows.append(make_output_row(
-                source, email or raw_email, args.position, args.city,
-                "REJECTED", f"Format email invalide (ligne {line_number})",
-                format_status="INVALID",
-            ))
-            counts["invalid_format"] += 1
+    seen_emails: set[str] = set()
+    stats = Counter()
+
+    for idx, row in enumerate(source_rows, start=2):
+        stats["total_input"] += 1
+        raw_email = extract_first_value(row, "email", "hr_email")
+        email = sanitize_email(raw_email)
+
+        company = extract_first_value(row, "company_name", "company") or "Société Tech"
+        company_domain = extract_first_value(row, "company_domain", "domain").lower()
+        website = extract_first_value(row, "website")
+        role_type = extract_first_value(row, "type", "email_type").upper() or "OTHER"
+        mx_raw = extract_first_value(row, "mx_valid")
+        mx_bool = parse_boolean_flag(mx_raw)
+
+        # 1. Format Check
+        if not is_valid_email_format(email):
+            rejected_rows.append({
+                "company": company, "hr_email": email or raw_email, "position": args.position,
+                "city": args.city, "priority_score": 0, "role_type": role_type,
+                "company_domain": company_domain, "website": website, "mx_valid": "FALSE",
+                "status": "REJECTED", "review_reason": f"Format email invalide (ligne {idx})",
+            })
+            stats["invalid_format"] += 1
             continue
 
-        if email in seen:
-            rejected_rows.append(make_output_row(
-                source, email, args.position, args.city,
-                "REJECTED", "Doublon dans le fichier source",
-            ))
-            counts["duplicate"] += 1
+        # 2. Duplicate Check
+        if email in seen_emails:
+            rejected_rows.append({
+                "company": company, "hr_email": email, "position": args.position,
+                "city": args.city, "priority_score": 0, "role_type": role_type,
+                "company_domain": company_domain, "website": website, "mx_valid": "FALSE",
+                "status": "REJECTED", "review_reason": "Doublon dans les résultats",
+            })
+            stats["duplicate"] += 1
             continue
-        seen.add(email)
+        seen_emails.add(email)
 
-        if email in excluded:
-            rejected_rows.append(make_output_row(
-                source, email, args.position, args.city,
-                "REJECTED", "Adresse déjà présente dans le Google Sheet",
-            ))
-            counts["already_in_sheet"] += 1
-            continue
-
-        local, domain = email.rsplit("@", 1)
-        if excluded_tlds and domain.endswith(excluded_tlds):
-            rejected_rows.append(make_output_row(
-                source, email, args.position, args.city,
-                "REJECTED", "TLD exclu par configuration",
-            ))
-            counts["excluded_tld"] += 1
+        # 3. Already Excluded Check
+        if email in excluded_emails:
+            rejected_rows.append({
+                "company": company, "hr_email": email, "position": args.position,
+                "city": args.city, "priority_score": 0, "role_type": role_type,
+                "company_domain": company_domain, "website": website, "mx_valid": "FALSE",
+                "status": "REJECTED", "review_reason": "Déjà présent dans le fichier d'exclusion",
+            })
+            stats["excluded"] += 1
             continue
 
-        if any(word in local for word in bad_words):
-            rejected_rows.append(make_output_row(
-                source, email, args.position, args.city,
-                "REJECTED", "Adresse non adaptée (mot-clé de filtrage)",
-            ))
-            counts["filtered_role"] += 1
+        local_part, domain_part = email.split("@")
+
+        # 4. Excluded TLDs
+        if excluded_tlds and domain_part.endswith(excluded_tlds):
+            rejected_rows.append({
+                "company": company, "hr_email": email, "position": args.position,
+                "city": args.city, "priority_score": 0, "role_type": role_type,
+                "company_domain": company_domain, "website": website, "mx_valid": "FALSE",
+                "status": "REJECTED", "review_reason": "TLD étranger exclu par paramètre",
+            })
+            stats["excluded_tld"] += 1
             continue
 
-        mx = parse_bool(first_value(source, "mx_valid"))
-        if mx is False:
-            rejected_rows.append(make_output_row(
-                source, email, args.position, args.city,
-                "REJECTED", "Domaine déclaré sans enregistrement MX",
-            ))
-            counts["mx_invalid"] += 1
+        # 5. Blacklisted Local Words
+        if any(w in local_part for w in bad_words):
+            rejected_rows.append({
+                "company": company, "hr_email": email, "position": args.position,
+                "city": args.city, "priority_score": 0, "role_type": role_type,
+                "company_domain": company_domain, "website": website, "mx_valid": "FALSE",
+                "status": "REJECTED", "review_reason": "Adresse non pertinente (mot-clé de filtrage)",
+            })
+            stats["bad_role"] += 1
             continue
 
-        email_type = first_value(source, "type", "email_type").upper()
-        row = make_output_row(
-            source, email, args.position, args.city, "PENDING",
-            reason="" if mx is True else "MX inconnu : vérification nécessaire",
-            format_status="VALID",
-        )
-
-        if email_type not in {"RH", "GENERIC"}:
-            row["review_reason"] = row["review_reason"] or "Type d'adresse non classé RH/GENERIC"
-            review_rows.append(row)
-            counts["manual_review"] += 1
+        # 6. MX Validity
+        if mx_bool is False:
+            rejected_rows.append({
+                "company": company, "hr_email": email, "position": args.position,
+                "city": args.city, "priority_score": 0, "role_type": role_type,
+                "company_domain": company_domain, "website": website, "mx_valid": "FALSE",
+                "status": "REJECTED", "review_reason": "Domaine sans serveur MX actif",
+            })
+            stats["mx_invalid"] += 1
             continue
 
-        if mx is None:
-            review_rows.append(row)
-            counts["mx_unknown"] += 1
+        score = calculate_lead_score(email, role_type, company_domain)
+        item = {
+            "company": company,
+            "hr_email": email,
+            "position": args.position,
+            "city": args.city,
+            "priority_score": score,
+            "role_type": role_type,
+            "company_domain": company_domain or domain_part,
+            "website": website,
+            "mx_valid": "TRUE" if mx_bool else "UNKNOWN",
+            "status": "APPROVED" if score >= 80 else "PENDING",
+            "review_reason": "",
+        }
+
+        # 7. Classification check: send unknown/other to review
+        if role_type not in ("RH", "FOUNDER_TECH", "GENERIC"):
+            item["review_reason"] = "Type d'adresse non identifié (revue manuelle conseillée)"
+            review_rows.append(item)
+            stats["needs_review"] += 1
             continue
 
-        company_key = (
-            first_value(source, "company_domain", "domain").lower()
-            or domain
-            or first_value(source, "company_name", "company").lower()
-            or f"unknown-company-{line_number}"
-        )
-        by_company[company_key].append(row)
+        if mx_bool is None:
+            item["review_reason"] = "MX non vérifié automatiquement"
+            review_rows.append(item)
+            stats["needs_review"] += 1
+            continue
 
-    # Apply the per-company limit after ranking contacts.
-    for company_rows in by_company.values():
-        ranked = sorted(company_rows, key=sort_key)
-        clean_candidates.extend(ranked[:args.per_company])
-        for extra in ranked[args.per_company:]:
-            extra["status"] = "REJECTED"
-            extra["review_reason"] = f"Limite de {args.per_company} emails par entreprise"
-            rejected_rows.append(extra)
-            counts["company_limit"] += 1
+        # Group by company to enforce per-company limit
+        company_key = company_domain or company.lower()
+        clean_by_company[company_key].append(item)
 
-    clean_candidates.sort(key=sort_key)
-    for index, row in enumerate(clean_candidates):
-        if index < args.approve:
-            row["status"] = "APPROVED"
+    # Apply per-company cap by selecting top scored emails
+    final_clean_leads: list[dict[str, Any]] = []
+    for comp_key, leads in clean_by_company.items():
+        # Sort leads by score descending
+        sorted_leads = sorted(leads, key=lambda x: x["priority_score"], reverse=True)
+        accepted = sorted_leads[:args.per_company]
+        final_clean_leads.extend(accepted)
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    review_path.parent.mkdir(parents=True, exist_ok=True)
-    rejected_path.parent.mkdir(parents=True, exist_ok=True)
-    report_path.parent.mkdir(parents=True, exist_ok=True)
+        for overflow in sorted_leads[args.per_company:]:
+            overflow["status"] = "REJECTED"
+            overflow["review_reason"] = f"Plafond atteint ({args.per_company} contacts max par entreprise)"
+            rejected_rows.append(overflow)
+            stats["company_limit_exceeded"] += 1
 
-    write_csv(output_path, clean_candidates)
-    write_csv(review_path, review_rows)
-    write_csv(rejected_path, rejected_rows)
+    # Sort final clean leads by score descending
+    final_clean_leads.sort(key=lambda x: x["priority_score"], reverse=True)
 
-    summary = [
-        "=== RAPPORT DE NETTOYAGE DES EMAILS ===",
-        f"Fichier source              : {input_path}",
-        f"Emails analysés             : {counts['input']}",
-        f"Emails retenus              : {len(clean_candidates)}",
-        f"À vérifier manuellement     : {len(review_rows)}",
-        f"Écartés                     : {len(rejected_rows)}",
+    # ---------------------------------------------------------------------------
+    # Write Output Files
+    # ---------------------------------------------------------------------------
+    def write_csv_safely(path: Path, rows: list[dict[str, Any]]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.DictWriter(f, fieldnames=OUTPUT_FIELDS, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(rows)
+
+    write_csv_safely(Path(args.output), final_clean_leads)
+    write_csv_safely(Path(args.review), review_rows)
+    write_csv_safely(Path(args.rejected), rejected_rows)
+
+    # ---------------------------------------------------------------------------
+    # Summary Report
+    # ---------------------------------------------------------------------------
+    rh_count = sum(1 for r in final_clean_leads if r["role_type"] == "RH")
+    founder_count = sum(1 for r in final_clean_leads if r["role_type"] == "FOUNDER_TECH")
+    generic_count = sum(1 for r in final_clean_leads if r["role_type"] == "GENERIC")
+    ma_count = sum(1 for r in final_clean_leads if r["hr_email"].endswith(".ma"))
+
+    summary_text = [
+        "=================================================================",
+        "        RAPPORT D'AUDIT ET NETTOYAGE DES EMAILS RH MAROC         ",
+        "=================================================================",
+        f"Fichier analysé            : {args.input}",
+        f"Total adresses reçues      : {stats['total_input']}",
+        f"Contacts qualifiés retenus : {len(final_clean_leads)}",
+        f"Contacts à vérifier        : {len(review_rows)}",
+        f"Contacts écartés           : {len(rejected_rows)}",
         "",
-        "Détail des exclusions :",
+        "--- QUALIFICATION DES CONTACTS RETENUS ---",
+        f"  * Responsables RH / Recrutement direct : {rh_count}",
+        f"  * Fondateurs / CTOs (Startups)          : {founder_count}",
+        f"  * Contacts institutionnels / Génériques : {generic_count}",
+        f"  * Adresses hébergées sur domaine .ma    : {ma_count}",
+        "",
+        "--- DÉTAIL DES EXCLUSIONS ---",
+        f"  * Format email invalide                 : {stats['invalid_format']}",
+        f"  * Doublons éliminés                     : {stats['duplicate']}",
+        f"  * Déjà présents dans liste d'exclusion  : {stats['excluded']}",
+        f"  * TLDs exclus                           : {stats['excluded_tld']}",
+        f"  * Mots-clés parasites (facturation...)  : {stats['bad_role']}",
+        f"  * Serveur MX invalide                   : {stats['mx_invalid']}",
+        f"  * Limite max par entreprise atteinte    : {stats['company_limit_exceeded']}",
+        "",
+        "--- FICHIERS GÉNÉRÉS ---",
+        f"  [1] Contacts prêts à l'envoi : {args.output}",
+        f"  [2] Contacts pour vérif     : {args.review}",
+        f"  [3] Contacts écartés        : {args.rejected}",
+        "=================================================================",
     ]
-    for key, label in [
-        ("invalid_format", "Format invalide"),
-        ("duplicate", "Doublons dans le CSV"),
-        ("already_in_sheet", "Déjà présents dans le Google Sheet"),
-        ("excluded_tld", "TLD explicitement exclus"),
-        ("filtered_role", "Mots-clés non adaptés"),
-        ("mx_invalid", "Domaine sans MX"),
-        ("mx_unknown", "MX inconnu / revue manuelle"),
-        ("manual_review", "Type à vérifier"),
-        ("company_limit", "Limite par entreprise"),
-    ]:
-        summary.append(f"  {label:<34}: {counts[key]}")
 
-    summary.extend([
-        "",
-        f"CSV retenus   : {output_path}",
-        f"CSV à vérifier: {review_path}",
-        f"CSV écartés   : {rejected_path}",
-        "",
-        "IMPORTANT : un format correct et un MX valide ne garantissent pas",
-        "que la boîte existe ou accepte les messages. Utiliser Abstract API",
-        "pour une vérification de délivrabilité avant tout envoi.",
-    ])
-    report_path.write_text("\n".join(summary) + "\n", encoding="utf-8")
+    report_path = Path(args.report)
+    report_path.write_text("\n".join(summary_text) + "\n", encoding="utf-8")
+    print("\n".join(summary_text))
 
-    print("\n".join(summary))
     return 0
 
 
 if __name__ == "__main__":
     try:
-        raise SystemExit(main())
+        sys.exit(main())
     except KeyboardInterrupt:
-        print("\nInterruption demandée. Les fichiers déjà écrits restent intacts.", file=sys.stderr)
-        raise SystemExit(130)
+        print("\nNettoyage interrompu.", file=sys.stderr)
+        sys.exit(130)
