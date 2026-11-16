@@ -1,0 +1,14 @@
+{
+  "background.fullscreen": {
+    "images": [
+      "C:/Users/yassi/OneDrive/Images/image/crescent-earth-moon.jpg"
+    ],
+    "opacity": 0.3,
+    "size": "cover",
+    "position": "center",
+    "interval": 0,
+    "random": false
+  },
+  "background.sidebar": {},
+  "background.panel": {}
+}
